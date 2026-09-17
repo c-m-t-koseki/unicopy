@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """MJ文字情報一覧表(xlsx) と MJ縮退マップ(json) を index.html 用の 1 ファイルに統合する。
 
-  python3 tools/build-mjmap.py mji.00602.xlsx MJShrinkMap.1.2.0.json -o mjmap.json
+  python3 tools/build-mjmap.py mji.00602.xlsx MJShrinkMap.1.2.0.json --ids ids.txt -o mjmap.json
+
+--ids を渡すと、tools/build_radicals.py で部首索引（app.js の水準字ぶん・mjmap.json の外字ぶん）も作る。
 
 xlsx は字形(IVS)を、縮退マップは縮退グラフを持つ。両者は MJ文字図形名で 1:1 に対応する。
 標準ライブラリのみで読む。この xlsx は strict OOXML なので名前空間が通常と違う点に注意。
@@ -11,7 +13,7 @@ xlsx は字形(IVS)を、縮退マップは縮退グラフを持つ。両者は 
 「規格の包摂か、法令の読み替えか、辞書の参考か」は残す必要があるため。
 MJ自身の面区点は別枠では持たない ―― 必ず包摂規準のエッジとして候補に含まれる（検証済み）。
 """
-import argparse, json, re, sys, zipfile
+import argparse, json, pathlib, re, sys, zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import date
@@ -26,19 +28,25 @@ NS = '{http://purl.oclc.org/ooxml/spreadsheetml/main}'
 # 「法務省戸籍法関連通達・通知」は3つの出典の寄せ集めなので種別で割る。
 # 親字・正字 16,305本 に対し、誤字俗字・正字一覧表が 1,001本、正字・俗字等対照表が 138本。
 # ひとまとめだと「正字の関係だけ採る」ができず、誤字までいっしょに付いてくる。
+# 誤字俗字・正字一覧表は `付記` でさらに割る。俗字は漢和辞典に載る同字の異体（戸籍に残せる）、
+# 無印は誤字（辞書に無い誤った字体。職権で正字に訂正）、別字は正字とは別の字だが混用されているもの
+# （申出で訂正）。「同じ字か」の確からしさが違うので、俗字 → 誤字 → 別字 の順に並べる。
+GOJI = '民一2842号通達別表 誤字俗字・正字一覧表'
 SRC_BITS = [
-    (None, None, 'JIS例示字形'),                   # 縮退マップ外。xlsx の X0213包摂区分0 が立てる
-    ('JIS包摂規準・UCS統合規則', None, 'JIS包摂規準・UCS統合規則'),
-    (None, None, '常用漢字表の新旧字体'),          # 縮退マップ外。下の BIT_KYUUJITAI が立てる
-    ('法務省戸籍法関連通達・通知', '戸籍統一文字情報 親字・正字', '戸籍統一文字情報 親字・正字'),
-    ('法務省戸籍法関連通達・通知', '民一2842号通達別表 誤字俗字・正字一覧表', '民一2842号通達別表 誤字俗字・正字一覧表'),
-    ('法務省戸籍法関連通達・通知', '民二5202号通知別表 正字・俗字等対照表', '民二5202号通知別表 正字・俗字等対照表'),
-    ('法務省告示582号別表第四', None, '法務省告示582号別表第四'),
-    ('辞書類等による関連字', None, '辞書類等による関連字'),
-    ('読み・字形による類推', None, '読み・字形による類推'),
+    (None, None, None, 'JIS例示字形'),                   # 縮退マップ外。xlsx の X0213包摂区分0 が立てる
+    ('JIS包摂規準・UCS統合規則', None, None, 'JIS包摂規準・UCS統合規則'),
+    (None, None, None, '常用漢字表の新旧字体'),          # 縮退マップ外。下の BIT_KYUUJITAI が立てる
+    ('法務省戸籍法関連通達・通知', '戸籍統一文字情報 親字・正字', None, '戸籍統一文字情報 親字・正字'),
+    ('法務省戸籍法関連通達・通知', GOJI, '俗字', GOJI + ' 俗字'),
+    ('法務省戸籍法関連通達・通知', '民二5202号通知別表 正字・俗字等対照表', None, '民二5202号通知別表 正字・俗字等対照表'),
+    ('法務省戸籍法関連通達・通知', GOJI, '無印', GOJI + ' 誤字'),
+    ('法務省戸籍法関連通達・通知', GOJI, '別字', GOJI + ' 別字'),
+    ('法務省告示582号別表第四', None, None, '法務省告示582号別表第四'),
+    ('辞書類等による関連字', None, None, '辞書類等による関連字'),
+    ('読み・字形による類推', None, None, '読み・字形による類推'),
 ]
 # 面区点を集めるときに見るキー（種別の違いは同じキーの中なので重複を除く）
-SRC_KEYS = list(dict.fromkeys(k for k, _, _ in SRC_BITS if k))
+SRC_KEYS = list(dict.fromkeys(k for k, _, _, _ in SRC_BITS if k))
 # bit1 は縮退マップ外の情報。常用漢字表(平成22年内閣告示第2号)の「いわゆる康熙字典体」で、
 # 旧字体を実装するMJから新字体の面区点へ向かうエッジに立てる。出典と一覧は下記に置いてある。
 # 戸籍法通達の部分集合ではない（包摂や582号だけで繋がる組が7本ある）ので独立したビットが要る。
@@ -172,11 +180,13 @@ def build(xlsx_path, shrink_path, kyuujitai):
         if i is None:
             print(f"warn: {item['MJ文字図形名']} は xlsx に無い", file=sys.stderr)
             continue
-        for si, (key, kind, _) in enumerate(SRC_BITS):
+        for si, (key, kind, fuki, _) in enumerate(SRC_BITS):
             if key is None:
                 continue
             for c in item.get(key, []):
                 if kind is not None and c.get('種別') != kind:
+                    continue
+                if fuki is not None and c.get('付記') != fuki:
                     continue
                 k = (i, jis_idx[c['JIS X 0213']])
                 pairs[k] = pairs.get(k, 0) | (1 << si)
@@ -195,19 +205,20 @@ def build(xlsx_path, shrink_path, kyuujitai):
         if k in pairs:
             pairs[k] |= BIT_REP
 
-    # 旧字体の面区点に包摂されるMJが、新字体の面区点にも縮退している組にビットを立てる
-    by_mj = {}
-    for (i, j), b in pairs.items():
-        by_mj.setdefault(i, []).append((j, b))
+    # 新旧字体は 邊→辺 という面区点どうしの対応なので、旧字体の正字（rep_of）から新字体への
+    # エッジ1本だけに立てる（無ければ作る）。邊 に包摂される他のMJへは立てない。
+    # どのMJが 辺 まで届くかは、読む側が「選んだ根拠で 邊 に届いたら 邊 の新旧字体を1段たどる」
+    # として決める（app.js buildEdges）。ここで他のMJにも立てると、戸籍に載っている字形だけが
+    # 親字・正字のエッジに相乗りして 辺 へ行き、載っていない字形は行かないという歪みが出る。
+    rep_mj = {code: index_of[n] for n, code in rep_of.items()}
     n_marked = 0
     for old, new in kyuujitai:
         oi, ni = jis_idx.get(old), jis_idx.get(new)
-        if oi is None or ni is None:
+        if oi is None or ni is None or old not in rep_mj:
+            print(f'warn: 新旧字体 {old}→{new} の正字が引けない', file=sys.stderr)
             continue
-        for i, es in by_mj.items():
-            if any(j == oi and b & BIT_HOUSETSU for j, b in es) and any(j == ni for j, b in es):
-                pairs[(i, ni)] |= BIT_KYUUJITAI
-                n_marked += 1
+        pairs[(rep_mj[old], ni)] = pairs.get((rep_mj[old], ni), 0) | BIT_KYUUJITAI
+        n_marked += 1
     print(f'新旧字体ビット: {n_marked:,} エッジ ({len(kyuujitai):,} 組から)', file=sys.stderr)
 
     # 縮退先は MJ にぶら下げる（別配列にすると添字を2つ持つぶん嵩む）
@@ -225,7 +236,7 @@ def build(xlsx_path, shrink_path, kyuujitai):
             'shrink': shrink['meta'].get('owl:versionInfo', ''),
             'built': date.today().isoformat(),
             # 縮退先のビットの意味。読む側がこれだけ見れば根拠を組み立てられる
-            'bits': [name for _, _, name in SRC_BITS],
+            'bits': [name for _, _, _, name in SRC_BITS],
         },
         'jis': [[code, jis_ch[code]] for code in jis],
         'mj': mj,
@@ -238,21 +249,31 @@ def main():
     p.add_argument('xlsx', help='MJ文字情報一覧表 (mji.*.xlsx)')
     p.add_argument('shrink', help='MJ縮退マップ (MJShrinkMap.*.json)')
     p.add_argument('-o', '--out', default='mjmap.json')
+    p.add_argument('--ids', help='IDSファイル (ids.txt)。渡すと部首索引も作る（tools/build_radicals.py）')
     a = p.parse_args()
 
     data = build(a.xlsx, a.shrink, read_kyuujitai(KYUUJITAI_MD))
+    # 外字の部首索引は mjmap.json に同居する。作り直すたびにここで足さないと索引が落ちたまま残る
+    # （CJK拡張C × 人偏 で 𪜸 が消えた）。水準字ぶんは app.js に書き戻す
+    if a.ids:
+        here = pathlib.Path(__file__).resolve().parent
+        sys.path.insert(0, str(here))
+        import build_radicals
+        build_radicals.apply(a.ids, str(here.parent / 'app.js'), data)
+    else:
+        print(f'warn: --ids を渡していないので {a.out} に部首索引が無い', file=sys.stderr)
     with open(a.out, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
 
     cand = [e for m in data['mj'] for e in m[2]]
     with_cand = sum(1 for m in data['mj'] if m[2])
-    LAW = 0b1111000  # 戸籍法通達の3種別 と 告示582号
+    LAW = 0b111111000  # 戸籍法通達の5区分 と 告示582号
     t = Counter(0 if e[1] & (BIT_REP | BIT_HOUSETSU) else (1 if e[1] & LAW else 2) for e in cand)
     print(f"{a.out}: MJ {len(data['mj']):,} / 縮退エッジ {len(cand):,} / "
           f"面区点 {len(data['jis']):,} / 縮退先なしMJ {len(data['mj']) - with_cand:,} / "
           f"IVSあり {sum(1 for m in data['mj'] if len(m[1]) > 1):,}\n"
           f"  線種: 実線(包摂・統合) {t[0]:,} / 破線(法令・告示) {t[1]:,} / 点線(辞書・類推のみ) {t[2]:,}")
-    for i, (_, _, name) in enumerate(SRC_BITS):
+    for i, (_, _, _, name) in enumerate(SRC_BITS):
         print(f"  bit{i} {name}: {sum(1 for e in cand if e[1] >> i & 1):,}")
 
 
