@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """MJ文字情報一覧表(xlsx) と MJ縮退マップ(json) を index.html 用の 1 ファイルに統合する。
 
-  python3 tools/build-mjmap.py mji.00602.xlsx MJShrinkMap.1.2.0.json --ids ids.txt -o mjmap.json
+  python3 tools/build-mjmap.py mji.00602.xlsx MJShrinkMap.1.2.0.json --ids ids.txt --unihan Unihan.zip -o mjmap.json
 
---ids を渡すと、tools/build_radicals.py で部首索引（app.js の水準字ぶん・mjmap.json の外字ぶん）も作る。
+--ids を渡すと、tools/build_radicals.py で部品の枠の束に並べるチップ（app.js）も作る。
+さらに --unihan を渡すと、tools/build_parts.py で部品の枠のデータ（parts.js・mjmap.json）も作る。
 
 xlsx は字形(IVS)を、縮退マップは縮退グラフを持つ。両者は MJ文字図形名で 1:1 に対応する。
 標準ライブラリのみで読む。この xlsx は strict OOXML なので名前空間が通常と違う点に注意。
@@ -44,6 +45,13 @@ SRC_BITS = [
     ('法務省告示582号別表第四', None, None, '法務省告示582号別表第四'),
     ('辞書類等による関連字', None, None, '辞書類等による関連字'),
     ('読み・字形による類推', None, None, '読み・字形による類推'),
+    # 親字・正字の縮退先のうち、その MJ で一番近いホップ数より遠いもの（親字の親字）。
+    # 縮退マップは親字の繋がりを JIS の字に届いた段だけ載せ、途中の字は載せない。
+    # MJ000050 は 1 ホップで 侮(FA30)、2 ホップで 侮(4FAE) で、遠い方まで親字・正字にすると
+    # 両方へ直接縮退するように見えるので、別の根拠に分ける。一番近いのが 2 ホップの MJ（784）は
+    # 途中の字が JIS に無いだけなので、その 2 ホップ目を親字・正字のままにする。
+    # 古い mjmap.json と並びを変えないよう、新しいビットは末尾に足す
+    ('法務省戸籍法関連通達・通知', '戸籍統一文字情報 親字・正字', 'far', '戸籍統一文字情報 親字の親字（2段以上）'),
 ]
 # 面区点を集めるときに見るキー（種別の違いは同じキーの中なので重複を除く）
 SRC_KEYS = list(dict.fromkeys(k for k, _, _, _ in SRC_BITS if k))
@@ -134,7 +142,7 @@ def read_kyuujitai(path):
 def build(xlsx_path, shrink_path, kyuujitai):
     with zipfile.ZipFile(xlsx_path) as z:
         shared = read_shared_strings(z)
-        mj, index_of, own, zero = [], {}, {}, {}
+        mj, index_of, own, zero, impl_of = [], {}, {}, {}, {}
         for r in read_rows(z, shared):
             name = r['mj']
             ucs = r.get('ucs', '')
@@ -145,20 +153,12 @@ def build(xlsx_path, shrink_path, kyuujitai):
                 # 1つの面区点に複数あることがあるので（10,909件／10,054面区点）、
                 # 「実装したUCS」が入っているものだけに絞って正字を1つに決める（下の rep_of）。
                 if r.get('houhsetsu') == '0':
-                    zero.setdefault(r['x0213'], []).append((name, bool(r.get('impl'))))
+                    zero.setdefault(r['x0213'], []).append((name, r.get('impl', '')))
+                if r.get('impl'):
+                    impl_of.setdefault(r['x0213'], []).append(name)
             sel = ivs_selector(r.get('ivs'), ucs, name)
             ch = chr(int(ucs[2:], 16)) if ucs else ''
             mj.append([int(name[2:]), ch + (chr(int(sel, 16)) if sel else '')])
-
-    # 面区点ごとの正字。「実装したUCS」が入っている区分0を採る。愛(1-16-06) なら
-    # 実装したUCSを持つ MJ011752 だけが残り、MJ011751(E0102) は落ちる。
-    # 実装したUCSを持つ区分0が1つも無い面区点が41あるので、そこは区分0が1つしか
-    # 無ければそれを使う（3面区点だけ絞りきれずに複数残る）。
-    rep_of = {}
-    for code, rows in zero.items():
-        impl = [n for n, has in rows if has] or ([rows[0][0]] if len(rows) == 1 else [])
-        for n in impl:
-            rep_of[n] = code
 
     with open(shrink_path, encoding='utf-8') as f:
         shrink = json.load(f)
@@ -169,24 +169,49 @@ def build(xlsx_path, shrink_path, kyuujitai):
         for key in SRC_KEYS:
             for c in item.get(key, []):
                 jis_ucs.setdefault(c['JIS X 0213'], c['UCS'][2:])
+    # 面区点ごとの正字。「実装したUCS」が入っている区分0を採る。愛(1-16-06) なら
+    # 実装したUCSを持つ MJ011752 だけが残り、MJ011751(E0102) は落ちる。
+    # 実装したUCSを持つ区分0が1つも無い面区点が41あるので、そこは区分0が1つしか
+    # 無ければそれを使う。
+    # それでも決まらない面区点が3つある（翫 1-20-69・甑 1-25-89・冤 1-49-45）。区分0の行が
+    # どれも実装したUCSを持たず、実装したUCSを持つ行は区分2。正字が無いと、包摂・統合を外したときに
+    # その面区点の字形がすべて外字へ落ちるので、実装したUCSを持つ行（区分を問わない）を正字にする。
+    # 逆に、実装したUCSを持つ区分0が別々の符号位置で2つ以上ある面区点が11ある（吉 と 𠮷、汨 と 汩 など）。
+    # 面区点そのものの符号位置（吉 1-21-40 なら U+5409）と一致する字形だけを正字にし、𠮷 は包摂で繋がる字形として扱う
+    # （どれも縮退マップの包摂規準のエッジを持つので、包摂を選べば今までどおり繋がる）。
+    rep_of = {}
+    for code, rows in zero.items():
+        impl = [n for n, u in rows if u] or ([rows[0][0]] if len(rows) == 1 else []) or impl_of.get(code, [])
+        if len(impl) > 1 and code in jis_ucs:
+            impl = [n for n, u in rows if u == 'U+' + jis_ucs[code]] or impl
+        for n in impl:
+            rep_of[n] = code
+
     jis = sorted(jis_ucs)
     jis_idx = {code: i for i, code in enumerate(jis)}
     jis_ch = {code: chr(int(h, 16)) for code, h in jis_ucs.items()}
 
     # (MJ, 縮退先) の重複を潰し、根拠はビットにまとめる
     pairs = {}
+    SEIJI = '戸籍統一文字情報 親字・正字'
     for item in shrink['content']:
         i = index_of.get(item['MJ文字図形名'])
         if i is None:
             print(f"warn: {item['MJ文字図形名']} は xlsx に無い", file=sys.stderr)
             continue
+        hops = [c['ホップ数'] for c in item.get('法務省戸籍法関連通達・通知', []) if c.get('種別') == SEIJI]
+        near = min(hops) if hops else None
         for si, (key, kind, fuki, _) in enumerate(SRC_BITS):
             if key is None:
                 continue
             for c in item.get(key, []):
                 if kind is not None and c.get('種別') != kind:
                     continue
-                if fuki is not None and c.get('付記') != fuki:
+                if kind == SEIJI:
+                    # 親字・正字は一番近いホップ数だけ、それより遠いものは「親字の親字」へ
+                    if (fuki == 'far') != (c['ホップ数'] > near):
+                        continue
+                elif fuki is not None and c.get('付記') != fuki:
                     continue
                 k = (i, jis_idx[c['JIS X 0213']])
                 pairs[k] = pairs.get(k, 0) | (1 << si)
@@ -249,19 +274,26 @@ def main():
     p.add_argument('xlsx', help='MJ文字情報一覧表 (mji.*.xlsx)')
     p.add_argument('shrink', help='MJ縮退マップ (MJShrinkMap.*.json)')
     p.add_argument('-o', '--out', default='mjmap.json')
-    p.add_argument('--ids', help='IDSファイル (ids.txt)。渡すと部首索引も作る（tools/build_radicals.py）')
+    p.add_argument('--ids', help='IDSファイル (ids.txt)。渡すと束のチップも作る（tools/build_radicals.py）')
+    p.add_argument('--unihan', help='Unihan.zip。--ids と一緒に渡すと部品の枠のデータも作る（tools/build_parts.py）')
     a = p.parse_args()
 
     data = build(a.xlsx, a.shrink, read_kyuujitai(KYUUJITAI_MD))
-    # 外字の部首索引は mjmap.json に同居する。作り直すたびにここで足さないと索引が落ちたまま残る
-    # （CJK拡張C × 人偏 で 𪜸 が消えた）。水準字ぶんは app.js に書き戻す
+    # 部品の枠の外字ぶん（ids / dictRadicals）は mjmap.json に同居する。作り直すたびにここで足さないと
+    # 落ちたまま残る（以前の部首索引で CJK拡張C × 人偏 の 𪜸 が消えた）。水準字ぶんは parts.js と app.js に書き戻す
     if a.ids:
         here = pathlib.Path(__file__).resolve().parent
         sys.path.insert(0, str(here))
         import build_radicals
         build_radicals.apply(a.ids, str(here.parent / 'app.js'), data)
+        # 外字ぶんの IDS と辞書の部首は mjmap.json に持つので、作り直すたびにここで足す
+        if a.unihan:
+            import build_parts
+            build_parts.apply(a.ids, a.unihan, str(here.parent / 'parts.js'), data)
+        else:
+            print(f'warn: --unihan を渡していないので {a.out} に部品の枠のデータが無い', file=sys.stderr)
     else:
-        print(f'warn: --ids を渡していないので {a.out} に部首索引が無い', file=sys.stderr)
+        print(f'warn: --ids を渡していないので {a.out} に部品の枠のデータが無い', file=sys.stderr)
     with open(a.out, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
 
